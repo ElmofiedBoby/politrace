@@ -22,10 +22,49 @@ class LegislatorParser:
     self.logger.info("Initializing LegislatorParser...")
     self._load_data()
     self.legislators_current_path: Path = Path(self.legislator_clean_path, "legislators-current.yaml")
+    self._load_legislators()
     self.logger.info("Initialized!")
 
   def _load_legislators(self):
     self.logger.info("Loading legislators...")
+    import yaml
+    
+    try:
+      with open(self.legislators_current_path, 'r') as file:
+        legislators_data = yaml.safe_load(file)
+        
+      self.logger.info(f"Loaded {len(legislators_data)} legislators")
+      
+      # Process each legislator
+      for legislator in legislators_data:
+        self._process_legislator(legislator)
+        
+    except FileNotFoundError:
+      self.logger.error(f"File not found: {self.legislators_current_path}")
+    except yaml.YAMLError as e:
+      self.logger.error(f"Error parsing YAML: {e}")
+  
+  def _process_legislator(self, legislator):
+    """Process individual legislator data"""
+    # Extract basic info
+    bioguide_id = legislator.get('id', {}).get('bioguide')
+    name = legislator.get('name', {})
+    bio = legislator.get('bio', {})
+    terms = legislator.get('terms', [])
+    
+    self.logger.debug(f"Processing legislator: {name.get('first')} {name.get('last')} (ID: {bioguide_id})")
+    
+    # You can add your specific processing logic here
+    # For example, storing to database, transforming data, etc.
+    
+    return {
+      'bioguide_id': bioguide_id,
+      'name': name,
+      'bio': bio,
+      'terms': terms,
+      'ids': legislator.get('id', {}),
+      'current_term': terms[-1] if terms else None
+    }
     
   
   def _load_data(self):
