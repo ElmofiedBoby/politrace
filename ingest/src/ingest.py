@@ -1,3 +1,4 @@
 from parsers.legislators import LegislatorParser
 
-LegislatorParser()
+parser = LegislatorParser()
+parser.load()
