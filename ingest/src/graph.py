@@ -31,8 +31,41 @@ from datetime import datetime
 from hashlib import sha1
 from typing import Any, Dict, Iterable, Optional
 import logging
+# Concurrency-related imports
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from neo4j.exceptions import TransientError, ServiceUnavailable
+import threading
+import time
 #logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Thread-safe, install-once guard for Neo4j constraints
+_CONSTRAINTS_INSTALLED = False
+_CONSTRAINTS_LOCK = threading.Lock()
+
+def _ensure_constraints(driver) -> None:
+    """Install constraints once per-process in a thread-safe way."""
+    global _CONSTRAINTS_INSTALLED
+    if _CONSTRAINTS_INSTALLED:
+        return
+    with _CONSTRAINTS_LOCK:
+        if _CONSTRAINTS_INSTALLED:
+            return
+        with driver.session() as s:
+            install_constraints(s)
+        _CONSTRAINTS_INSTALLED = True
+
+def _retry(fn, retries: int = 3, base_sleep: float = 0.25):
+    """Exponential backoff retry for transient Neo4j errors."""
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except (TransientError, ServiceUnavailable) as e:
+            attempt += 1
+            if attempt > retries:
+                raise
+            time.sleep(base_sleep * (2 ** (attempt - 1)))
 
 # -----------------------
 # Helpers & normalization
@@ -260,21 +293,172 @@ def ingest_legislator(session, entry: Dict[str, Any], source: SourceMeta) -> Non
     for term in terms:
         upsert_term_events(session, bioguide, term, source)
 
+# -----------------------
+# Bulk ingestion helpers
+# -----------------------
+
+def _ingest_one(entry: Dict[str, Any], src: SourceMeta, driver) -> None:
+    """Single-entry ingestion with its own Neo4j session."""
+    _ensure_constraints(driver)
+    with driver.session() as sess:
+        ingest_legislator(sess, entry, src)
+
+
+# -----------------------
+# Bulk concurrent API
+# -----------------------
+
+def insert_many(
+    entries: Iterable[Dict[str, Any]],
+    src: SourceMeta,
+    render_visual: bool = False,
+    workers: int = 8,
+    db_uri: str = "neo4j://localhost:7687",
+    db_user: str = "neo4j",
+    db_pass: str = "your_password",
+) -> Dict[str, Any]:
+    """
+    Concurrently ingest many legislator entries into Neo4j.
+    - Uses a shared Neo4j driver (thread-safe) and a new session per task (not shared).
+    - Constraints are installed once per process.
+    - Visualizations are rendered *after* DB ingest to avoid matplotlib thread issues.
+    Returns a summary dict with per-entry status.
+    """
+    entries_list = list(entries)
+    total = len(entries_list)
+    if total == 0:
+        return {"count": 0, "results": []}
+
+    out_dir = Path("./data/out")
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    driver = GraphDatabase.driver(db_uri, auth=(db_user, db_pass))
+    results: list[Dict[str, Any]] = []
+    try:
+        _ensure_constraints(driver)
+        logger.info(f"Starting ingest of {total} entries with {workers} workers...")
+
+        def task(entry: Dict[str, Any]) -> tuple[str, Optional[Exception]]:
+            bioguide = entry.get("bioguide_id") or (entry.get("ids", {}) or {}).get("bioguide")
+            try:
+                _retry(lambda: _ingest_one(entry, src, driver))
+                return (str(bioguide), None)
+            except Exception as e:
+                return (str(bioguide), e)
+
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            futures = {pool.submit(task, e): e for e in entries_list}
+            for f in as_completed(futures):
+                bid, err = f.result()
+                if err is None:
+                    logger.info(f"Ingested {bid}")
+                    results.append({"bioguide_id": bid, "status": "ok"})
+                else:
+                    logger.error(f"Ingest failed for {bid}: {err}")
+                    results.append({"bioguide_id": bid, "status": "error", "error": repr(err)})
+
+        # Render visuals sequentially to avoid matplotlib global-state issues
+        if render_visual:
+            for e in entries_list:
+                bid = e.get("bioguide_id") or (e.get("ids", {}) or {}).get("bioguide")
+                png_path = out_dir / f"{bid}_graph.png"
+                gml_path = out_dir / f"{bid}.graphml"
+                try:
+                    render_person_png(e, src, str(png_path), str(gml_path))
+                    logger.info(f"Wrote visualization to {png_path} and {gml_path}")
+                except Exception as viz_err:
+                    logger.error(f"Visualization failed for {bid}: {viz_err}")
+                    results.append({"bioguide_id": bid, "status": "ok", "visualization_error": repr(viz_err)})
+
+        return {"count": total, "results": results}
+    finally:
+        driver.close()
+
 
 # -----------------------
 # Visualization & Usage
 # -----------------------
 
-def wipe_neo4j_database():
-    """Wipes all nodes and relationships from the Neo4j database."""
+def wipe_neo4j_database(batch_size: int = 20000, use_apoc: bool = True, sleep_between: float = 0.0):
+    """
+    Wipes all nodes and relationships from the Neo4j database with low memory pressure.
+    Strategy:
+      1) Prefer APOC periodic iterate (fast & low memory) if available.
+      2) Fallback to batched loops:
+         a) Delete relationships in batches
+         b) Delete nodes in batches
+    Args:
+        batch_size: number of rows per batch (tune based on hardware)
+        use_apoc: attempt to use APOC if available
+        sleep_between: optional sleep between batches to reduce load
+    """
     driver = None
     try:
         driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
         with driver.session() as session:
-            # Cypher query to detach and delete all nodes and their relationships
-            query = "MATCH (n) DETACH DELETE n"
-            result = session.run(query)
-            print(f"Database wiped successfully. Counters: {result.consume().counters}")
+            # Try APOC first
+            if use_apoc:
+                try:
+                    # Probe APOC availability
+                    session.run("RETURN apoc.version() AS v").single()
+                    # Use APOC periodic iterate for efficient batched delete
+                    q = (
+                        "CALL apoc.periodic.iterate("
+                        "  'MATCH (n) RETURN n',"
+                        "  'DETACH DELETE n',"
+                        "  {batchSize:$batch, parallel:true}"
+                        ") YIELD batches, total "
+                        "RETURN batches, total"
+                    )
+                    res = session.run(q, {"batch": batch_size}).single()
+                    print(f"APOC deletion completed. batches={res['batches']} total={res['total']}")
+                    return
+                except Exception as e:
+                    print(f"APOC not available or failed ({e}); falling back to batched loop...")
+
+            # ---- Fallback: two-phase batched deletion (low memory) ----
+            total_rels = 0
+            total_nodes = 0
+
+            # Phase 1: relationships
+            while True:
+                r = session.run(
+                    """
+                    MATCH ()-[r]->()
+                    WITH r LIMIT $batch
+                    DELETE r
+                    RETURN count(*) AS deleted
+                    """,
+                    {"batch": batch_size},
+                ).single()
+                deleted = r["deleted"] or 0
+                total_rels += deleted
+                print(f"Deleted relationships batch: {deleted} (total {total_rels})")
+                if deleted == 0:
+                    break
+                if sleep_between > 0:
+                    time.sleep(sleep_between)
+
+            # Phase 2: nodes
+            while True:
+                r = session.run(
+                    """
+                    MATCH (n)
+                    WITH n LIMIT $batch
+                    DELETE n
+                    RETURN count(*) AS deleted
+                    """,
+                    {"batch": batch_size},
+                ).single()
+                deleted = r["deleted"] or 0
+                total_nodes += deleted
+                print(f"Deleted nodes batch: {deleted} (total {total_nodes})")
+                if deleted == 0:
+                    break
+                if sleep_between > 0:
+                    time.sleep(sleep_between)
+
+            print(f"Database wiped. Total rels={total_rels}, nodes={total_nodes}")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
@@ -367,22 +551,17 @@ def render_person_png(entry: Dict[str, Any], source: SourceMeta, out_png: str, o
 
 def insert_data(entry: Dict[str, Any], src: SourceMeta, render_visual: bool = False):
     
-    # This section only prints how many events would be inserted; remove in real use
-    logger.info(f"Would ingest Person {entry['bioguide_id']} with {len(entry.get('terms', []))} term windows.")
-    out_dir = Path("./data/out"); out_dir.mkdir(exist_ok=True)
-
+    # Maintain the original single-entry API by delegating to the bulk inserter.
+    summary = insert_many([entry], src, render_visual=render_visual, workers=1)
+    # Mirror the original logging style for a single record:
+    bioguide = entry.get("bioguide_id") or (entry.get("ids", {}) or {}).get("bioguide")
     if render_visual:
-        png_path = out_dir / f"{entry['bioguide_id']}_graph.png"
-        gml_path = out_dir / f"{entry['bioguide_id']}.graphml"
-        render_person_png(entry, src, str(png_path), str(gml_path))
-        logger.info(f"Wrote visualization to {png_path} and {gml_path}")
-    
-    logger.info(f"Ingesting Person {entry['bioguide_id']} into Neo4j...")
-    driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
-    with driver.session() as sess:
-        install_constraints(sess)
-        ingest_legislator(sess, entry, src)
-    logger.info(f"Successfully ingested Person {entry['bioguide_id']}.")
+        logger.info(f"Wrote visualization to ./data/out/{bioguide}_graph.png and ./data/out/{bioguide}.graphml")
+    if any(r.get("status") == "error" for r in summary["results"]):
+        logger.error(f"Ingest encountered an error for {bioguide}.")
+    else:
+        logger.info(f"Successfully ingested Person {bioguide}.")
+    return summary
 
 
 # -----------------------
