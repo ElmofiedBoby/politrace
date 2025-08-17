@@ -23,6 +23,7 @@ Tested on Neo4j 5.x. For 4.x, replace composite constraints with single-property
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha1
@@ -75,16 +76,16 @@ class SourceMeta:
 
 def install_constraints(session) -> None:
     """Create uniqueness constraints (Neo4j 5.x). Safe to run repeatedly."""
-    session.run(
-        """
-        CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.bioguide_id IS UNIQUE;
-        CREATE CONSTRAINT IF NOT EXISTS FOR (s:Source) REQUIRE s.source_id IS UNIQUE;
-        CREATE CONSTRAINT IF NOT EXISTS FOR (o:Organization) REQUIRE (o.org_type, o.short) IS UNIQUE;
-        CREATE CONSTRAINT IF NOT EXISTS FOR (g:Geography) REQUIRE (g.kind, g.code) IS UNIQUE;
-        CREATE CONSTRAINT IF NOT EXISTS FOR (e:OfficeTerm) REQUIRE e.key IS UNIQUE;
-        CREATE CONSTRAINT IF NOT EXISTS FOR (e:PartyAffiliation) REQUIRE e.key IS UNIQUE;
-        """
-    )
+    constraint_queries = [
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.bioguide_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Source) REQUIRE s.source_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (o:Organization) REQUIRE (o.org_type, o.short) IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (g:Geography) REQUIRE (g.kind, g.code) IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (e:OfficeTerm) REQUIRE e.key IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (e:PartyAffiliation) REQUIRE e.key IS UNIQUE"
+    ]
+    for query in constraint_queries:
+        session.run(query)
 
 
 # -----------------------
@@ -123,10 +124,10 @@ def upsert_person(session, entry: Dict[str, Any]) -> None:
             "bioguide_id": entry.get("bioguide_id") or ids.get("bioguide"),
             "first": name.get("first"),
             "last": name.get("last"),
-            "full": name.get("official_full") or f"{name.get('first','')} {name.get('last','')}".strip(),
+            "full": name.get("official_full") or f"{name.get('first', '')} {name.get('last', '')}".strip(),
             "birthday": bio.get("birthday"),
             "gender": bio.get("gender"),
-            "identifiers": ids,
+            "identifiers": json.dumps(ids)
         },
     )
 
@@ -188,6 +189,7 @@ def upsert_term_events(session, person_bioguide: str, term: Dict[str, Any], src:
       ON CREATE SET src.url=$source_url, src.publisher=$source_publisher, src.retrieved_at=datetime($retrieved_at)
 
     // Person anchor
+    WITH *
     MATCH (p:Person {bioguide_id:$bioguide_id})
 
     // Geography
@@ -256,7 +258,7 @@ def build_person_graph_from_entry(entry: Dict[str, Any], source: SourceMeta):
     # Person anchor
     bioguide = entry.get("bioguide_id") or entry.get("ids", {}).get("bioguide")
     nm = entry.get("name", {})
-    person_label = f"Person: {nm.get('official_full') or nm.get('first','') + ' ' + nm.get('last','')}\n({bioguide})"
+    person_label = f"Person: {nm.get('official_full') or nm.get('first', '') + ' ' + nm.get('last', '')}\n({bioguide})"
     G.add_node(person_label, layer=L_PERSON, kind="Person")
 
     # One synthetic Source node for this dataset
@@ -334,7 +336,7 @@ if __name__ == "__main__":
 
     # --- Demo: render PNG/GraphML locally ---
     from pathlib import Path
-    out_dir = Path("./out"); out_dir.mkdir(exist_ok=True)
+    out_dir = Path("./data/out"); out_dir.mkdir(exist_ok=True)
     src = SourceMeta(
         source_id="congress-legislators@sample",
         url="https://github.com/unitedstates/congress-legislators",
@@ -346,12 +348,12 @@ if __name__ == "__main__":
     print(f"Wrote visualization to {png_path} and {gml_path}")
 
     # Live run example:
-    # from neo4j import GraphDatabase
-    # driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","password"))
-    # with driver.session() as sess:
-    #     install_constraints(sess)
-    #     ingest_legislator(sess, SAMPLE_ENTRY, SourceMeta(
-    #         source_id="us-congress-legislators@<commit>",
-    #         url="https://github.com/unitedstates/congress-legislators",
-    #         publisher="unitedstates/congress-legislators",
-    #     ))
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
+    with driver.session() as sess:
+        install_constraints(sess)
+        ingest_legislator(sess, SAMPLE_ENTRY, SourceMeta(
+            source_id="us-congress-legislators@<commit>",
+            url="https://github.com/unitedstates/congress-legislators",
+            publisher="unitedstates/congress-legislators",
+        ))
