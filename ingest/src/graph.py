@@ -31,7 +31,7 @@ from datetime import datetime
 from hashlib import sha1
 from typing import Any, Dict, Iterable, Optional
 import logging
-logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # -----------------------
@@ -43,22 +43,6 @@ PARTY_MAP = {
     "Republican": ("REP", "Republican Party"),
     "Independent": ("IND", "Independent"),
 }
-
-def wipe_neo4j_database():
-    """Wipes all nodes and relationships from the Neo4j database."""
-    driver = None
-    try:
-        driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
-        with driver.session() as session:
-            # Cypher query to detach and delete all nodes and their relationships
-            query = "MATCH (n) DETACH DELETE n"
-            result = session.run(query)
-            print(f"Database wiped successfully. Counters: {result.consume().counters}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        if driver:
-            driver.close()
 
 
 def norm_party(party: Optional[str]) -> tuple[str, str]:
@@ -113,6 +97,18 @@ def install_constraints(session) -> None:
 # Ingest functions
 # -----------------------
 
+def get_all_ids(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Helper to consistently resolve all ids from an entry."""
+    ids = entry.get("ids", {}).copy()
+    if "bioguide_id" in entry:
+        ids["bioguide"] = entry["bioguide_id"]
+    return ids
+
+def get_bioguide(entry: Dict[str, Any]) -> Optional[str]:
+    """Helper to consistently resolve the bioguide id from an entry."""
+    ids = get_all_ids(entry)
+    return ids.get("bioguide")
+
 def upsert_source(session, src: SourceMeta) -> None:
     session.run(
         """
@@ -158,7 +154,7 @@ def upsert_term_events(session, person_bioguide: str, term: Dict[str, Any], src:
     term_type = term.get("type")  # 'rep' or 'sen'
     chamber = "HOUSE" if term_type == "rep" else "SENATE"
     state = term.get("state")
-    district = int(term["district"]) if term_type == "rep" and "district" in term else None
+    district_val = int(term["district"]) if term_type == "rep" and "district" in term else None
     sen_class = term.get("class") if term_type == "sen" else None
     start = term.get("start")
     end = term.get("end")
@@ -168,7 +164,8 @@ def upsert_term_events(session, person_bioguide: str, term: Dict[str, Any], src:
     # Geography node
     if chamber == "HOUSE":
         geo_kind = "DISTRICT"
-        geo_code = f"{state}-{district}"
+        d_code = "AL" if (district_val in (None, -1, 0)) else str(district_val)
+        geo_code = f"{state}-{d_code}"
         geo_name = geo_code
     else:
         geo_kind = "STATE"
@@ -177,7 +174,7 @@ def upsert_term_events(session, person_bioguide: str, term: Dict[str, Any], src:
 
     now_iso = datetime.utcnow().isoformat()
 
-    office_key = fact_key("OfficeTerm", person_bioguide, chamber, state, district, sen_class, start, end)
+    office_key = fact_key("OfficeTerm", person_bioguide, chamber, state, district_val, sen_class, start, end)
     party_key = fact_key("PartyAffiliation", person_bioguide, party_short, start, end)
 
     params = {
@@ -197,7 +194,7 @@ def upsert_term_events(session, person_bioguide: str, term: Dict[str, Any], src:
         "party_key": party_key,
         "chamber": chamber,
         "state": state,
-        "district": district,
+        "district": district_val,
         "class": sen_class,
         "term_start": start,
         "term_end": end,
@@ -265,8 +262,24 @@ def ingest_legislator(session, entry: Dict[str, Any], source: SourceMeta) -> Non
 
 
 # -----------------------
-# Visualization (optional PNG/GraphML export)
+# Visualization & Usage
 # -----------------------
+
+def wipe_neo4j_database():
+    """Wipes all nodes and relationships from the Neo4j database."""
+    driver = None
+    try:
+        driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
+        with driver.session() as session:
+            # Cypher query to detach and delete all nodes and their relationships
+            query = "MATCH (n) DETACH DELETE n"
+            result = session.run(query)
+            print(f"Database wiped successfully. Counters: {result.consume().counters}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if driver:
+            driver.close()
 
 def build_person_graph_from_entry(entry: Dict[str, Any], source: SourceMeta):
     """Build a NetworkX DiGraph representing the temporal schema for a single person entry."""
@@ -305,8 +318,15 @@ def build_person_graph_from_entry(entry: Dict[str, Any], source: SourceMeta):
         G.add_node(party_label, layer=L_ENTITY, kind="Organization(PARTY)")
 
         # Event nodes
+        d_for_label = None
+        if chamber == "HOUSE":
+            try:
+                d_for_label = int(district) if district is not None else None
+            except (TypeError, ValueError):
+                d_for_label = None
+        d_suffix = f"-{'AL' if (d_for_label in (None, -1, 0)) else str(d_for_label)}" if chamber == "HOUSE" else ""
         ot_label = (
-            f"OfficeTerm: {chamber} {state}{('-' + str(district)) if district else ''}"
+            f"OfficeTerm: {chamber} {state}{d_suffix}"
             f"\n({start} → {end or ''})"
         )
         pa_label = f"PartyAffiliation: {party_short}\n({start} → {end or ''})"
