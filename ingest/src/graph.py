@@ -24,10 +24,15 @@ Tested on Neo4j 5.x. For 4.x, replace composite constraints with single-property
 from __future__ import annotations
 
 import json
+from neo4j import GraphDatabase
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha1
 from typing import Any, Dict, Iterable, Optional
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # -----------------------
 # Helpers & normalization
@@ -38,6 +43,22 @@ PARTY_MAP = {
     "Republican": ("REP", "Republican Party"),
     "Independent": ("IND", "Independent"),
 }
+
+def wipe_neo4j_database():
+    """Wipes all nodes and relationships from the Neo4j database."""
+    driver = None
+    try:
+        driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
+        with driver.session() as session:
+            # Cypher query to detach and delete all nodes and their relationships
+            query = "MATCH (n) DETACH DELETE n"
+            result = session.run(query)
+            print(f"Database wiped successfully. Counters: {result.consume().counters}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if driver:
+            driver.close()
 
 
 def norm_party(party: Optional[str]) -> tuple[str, str]:
@@ -324,36 +345,36 @@ def render_person_png(entry: Dict[str, Any], source: SourceMeta, out_png: str, o
         nx.write_graphml(G, out_graphml)
     return out_png
 
+def insert_data(entry: Dict[str, Any], src: SourceMeta, render_visual: bool = False):
+    
+    # This section only prints how many events would be inserted; remove in real use
+    logger.info(f"Would ingest Person {entry['bioguide_id']} with {len(entry.get('terms', []))} term windows.")
+    out_dir = Path("./data/out"); out_dir.mkdir(exist_ok=True)
+
+    if render_visual:
+        png_path = out_dir / f"{entry['bioguide_id']}_graph.png"
+        gml_path = out_dir / f"{entry['bioguide_id']}.graphml"
+        render_person_png(entry, src, str(png_path), str(gml_path))
+        logger.info(f"Wrote visualization to {png_path} and {gml_path}")
+    
+    logger.info(f"Ingesting Person {entry['bioguide_id']} into Neo4j...")
+    driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
+    with driver.session() as sess:
+        install_constraints(sess)
+        ingest_legislator(sess, entry, src)
+    logger.info(f"Successfully ingested Person {entry['bioguide_id']}.")
+
+
 # -----------------------
 # Quick manual test hook
 # -----------------------
 if __name__ == "__main__":
     # Minimal demo using the sample entry from the user prompt
     SAMPLE_ENTRY = {'bioguide_id': 'C000127', 'name': {'first': 'Maria', 'last': 'Cantwell', 'official_full': 'Maria Cantwell'}, 'bio': {'birthday': '1958-10-13', 'gender': 'F'}, 'terms': [{'type': 'rep', 'start': '1993-01-05', 'end': '1995-01-03', 'state': 'WA', 'district': 1, 'party': 'Democrat'}, {'type': 'sen', 'start': '2001-01-03', 'end': '2007-01-03', 'state': 'WA', 'class': 1, 'party': 'Democrat', 'url': 'http://cantwell.senate.gov'}, {'type': 'sen', 'start': '2007-01-04', 'end': '2013-01-03', 'state': 'WA', 'class': 1, 'party': 'Democrat', 'url': 'http://cantwell.senate.gov', 'address': '311 HART SENATE OFFICE BUILDING WASHINGTON DC 20510', 'phone': '202-224-3441', 'fax': '202-228-0514', 'contact_form': 'http://www.cantwell.senate.gov/contact/', 'office': '311 Hart Senate Office Building'}, {'type': 'sen', 'start': '2013-01-03', 'end': '2019-01-03', 'state': 'WA', 'party': 'Democrat', 'class': 1, 'url': 'https://www.cantwell.senate.gov', 'address': '511 Hart Senate Office Building Washington DC 20510', 'phone': '202-224-3441', 'fax': '202-228-0514', 'contact_form': 'http://www.cantwell.senate.gov/public/index.cfm/email-maria', 'office': '511 Hart Senate Office Building', 'state_rank': 'junior', 'rss_url': 'http://www.cantwell.senate.gov/public/index.cfm/rss/feed'}, {'type': 'sen', 'start': '2019-01-03', 'end': '2025-01-03', 'state': 'WA', 'class': 1, 'party': 'Democrat', 'state_rank': 'junior', 'url': 'https://www.cantwell.senate.gov', 'rss_url': 'http://www.cantwell.senate.gov/public/index.cfm/rss/feed', 'contact_form': 'https://www.cantwell.senate.gov/public/index.cfm/email-maria', 'address': '511 Hart Senate Office Building Washington DC 20510', 'office': '511 Hart Senate Office Building', 'phone': '202-224-3441'}, {'type': 'sen', 'start': '2025-01-03', 'end': '2031-01-03', 'state': 'WA', 'class': 1, 'state_rank': 'junior', 'party': 'Democrat', 'url': 'https://www.cantwell.senate.gov', 'rss_url': 'http://www.cantwell.senate.gov/public/index.cfm/rss/feed', 'contact_form': 'https://www.cantwell.senate.gov/public/index.cfm/email-maria', 'address': '511 Hart Senate Office Building Washington DC 20510', 'office': '511 Hart Senate Office Building', 'phone': '202-224-3441'}], 'ids': {'bioguide': 'C000127', 'thomas': '00172', 'lis': 'S275', 'govtrack': 300018, 'opensecrets': 'N00007836', 'votesmart': 27122, 'fec': ['S8WA00194', 'H2WA01054'], 'cspan': 26137, 'wikipedia': 'Maria Cantwell', 'house_history': 10608, 'ballotpedia': 'Maria Cantwell', 'maplight': 544, 'icpsr': 39310, 'wikidata': 'Q22250', 'google_entity_id': 'kg:/m/01x68t', 'pictorial': 13398}, 'current_term': {'type': 'sen', 'start': '2025-01-03', 'end': '2031-01-03', 'state': 'WA', 'class': 1, 'state_rank': 'junior', 'party': 'Democrat', 'url': 'https://www.cantwell.senate.gov', 'rss_url': 'http://www.cantwell.senate.gov/public/index.cfm/rss/feed', 'contact_form': 'https://www.cantwell.senate.gov/public/index.cfm/email-maria', 'address': '511 Hart Senate Office Building Washington DC 20510', 'office': '511 Hart Senate Office Building', 'phone': '202-224-3441'}}
-
-    # This section only prints how many events would be inserted; remove in real use
-    print(f"Would ingest Person {SAMPLE_ENTRY['bioguide_id']} with {len(SAMPLE_ENTRY.get('terms', []))} term windows.")
-
-    # --- Demo: render PNG/GraphML locally ---
-    from pathlib import Path
-    out_dir = Path("./data/out"); out_dir.mkdir(exist_ok=True)
     src = SourceMeta(
         source_id="congress-legislators@sample",
         url="https://github.com/unitedstates/congress-legislators",
         publisher="unitedstates/congress-legislators",
     )
-    png_path = out_dir / f"{SAMPLE_ENTRY['bioguide_id']}_graph.png"
-    gml_path = out_dir / f"{SAMPLE_ENTRY['bioguide_id']}.graphml"
-    render_person_png(SAMPLE_ENTRY, src, str(png_path), str(gml_path))
-    print(f"Wrote visualization to {png_path} and {gml_path}")
 
-    # Live run example:
-    from neo4j import GraphDatabase
-    driver = GraphDatabase.driver("neo4j://localhost:7687", auth=("neo4j","your_password"))
-    with driver.session() as sess:
-        install_constraints(sess)
-        ingest_legislator(sess, SAMPLE_ENTRY, SourceMeta(
-            source_id="us-congress-legislators@<commit>",
-            url="https://github.com/unitedstates/congress-legislators",
-            publisher="unitedstates/congress-legislators",
-        ))
+    insert_data(SAMPLE_ENTRY, src, render_visual=True)

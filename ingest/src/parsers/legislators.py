@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 from git import Repo
 from config import Config
+from graph import SourceMeta
 
 """
 Parser for legislator data from github.com/unitedstates/congress-legislators.
@@ -37,6 +38,13 @@ class LegislatorParser:
         if self.legislators:
             self.logger.info(f"First legislator loaded: {self.legislators[0]}")
 
+    def get_source(self) -> SourceMeta:
+       return SourceMeta(
+            source_id="congress-legislators@sample",
+            url="https://github.com/unitedstates/congress-legislators",
+            publisher="unitedstates/congress-legislators",
+        )
+    
     def _load_legislators(self) -> None:
         """Load and process legislator YAML data."""
         self.logger.info("Loading legislators from YAML...")
