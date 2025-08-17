@@ -1,3 +1,4 @@
 .replit
 __pycache__
 ingest/src/data
+.venv
